@@ -15,9 +15,6 @@ type Obj = Blob | Tree | CommitObj;
 
 const store = new Map<string, Obj>();
 const repos = new Map<string, any>();
-const users: Json = {};
-let repoSeq = 1;
-
 function putObj(o: Obj): string {
   const raw = o.type === 'blob' ? Buffer.from(o.data, 'utf8')
     : o.type === 'tree' ? Buffer.from(o.entries.map(e => `${e.mode} ${e.name}\0${e.sha}`).join('\n'), 'utf8')
@@ -28,7 +25,6 @@ function putObj(o: Obj): string {
 }
 function getObj(id: string): Obj | undefined { return store.get(id); }
 
-type Ref = { sha: string };
 function newRepo(name: string, priv: boolean, owner: string, desc: string | null = null) {
   const r = {
     name, private: priv, owner, description: desc,
@@ -37,7 +33,7 @@ function newRepo(name: string, priv: boolean, owner: string, desc: string | null
     issues: [] as any[], issueSeq: 0,
     labels: new Map<string, string>(),
     pulls: [] as any[], pullSeq: 0,
-    id: ++REPO_SEQ,
+    id: ++repoSeq,
     node_id: '',
   };
   r.node_id = 'R_' + owner + '_' + name;
@@ -45,12 +41,11 @@ function newRepo(name: string, priv: boolean, owner: string, desc: string | null
   return r;
 }
 
+let repoSeq = 1000;
 // token -> login
-let REPO_SEQ = 1000;
 const TOKENS = new Map<string, string>();
 const VIEWER = process.env.MAKEFUN_SHOP_TOKEN ?? 'tok';
 TOKENS.set(VIEWER, 'adaiversen');
-let LOGIN = 'adaiversen';
 
 function sendJson(res: ServerResponse, status: number, body: unknown, headers: Readonly<Record<string, string>> = {}): void {
   const text = `${JSON.stringify(body)}\n`;
@@ -71,7 +66,17 @@ async function readBody(req: IncomingMessage): Promise<Buffer> {
   return Buffer.concat(chunks);
 }
 function parseJsonBody(buf: Buffer): Json | null {
-  try { return JSON.parse(buf.toString('utf8')) as Json; } catch { return null; }
+  try {
+    const parsed: unknown = JSON.parse(buf.toString('utf8'));
+    if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) return null;
+    return parsed as Json;
+  } catch { return null; }
+}
+
+function parseIntInput(value: unknown, fallback: number): number | null {
+  const text = value === undefined || value === null || value === '' ? String(fallback) : String(value);
+  const parsed = Number.parseInt(text, 10);
+  return Number.isInteger(parsed) ? parsed : null;
 }
 
 function repoRef(path: string): { owner: string; name: string; r: any } | undefined {
@@ -87,7 +92,7 @@ function userRepos(login: string) {
   return [...repos.values()].filter(r => r.owner === login);
 }
 
-function commitJson(r: any, sha: string) {
+function commitJson(sha: string) {
   const o = getObj(sha) as CommitObj;
   return { sha, commit: { message: o.message, author: { name: 'a', email: 'a@e.x', date: new Date(o.ts * 1000).toISOString() }, committer: { name: 'a', email: 'a@e.x', date: new Date(o.ts * 1000).toISOString() } }, html_url: '', url: '' };
 }
@@ -137,9 +142,9 @@ function doMerge(r: any, pr: any): void {
   const baseSha = r.refs.get(`refs/heads/${pr.base_ref ?? pr.base?.ref}`) ?? '';
   if (baseSha) parents.push(baseSha);
   const mergedEntries = baseTree.entries.concat(headTree.entries.filter((h: any) => !baseTree.entries.some((e: any) => e.name === h.name)));
-  const c = commitTree(r, mergedEntries.map((e: any) => ({ mode: e.mode ?? '100644', name: e.name, sha: e.sha })), parents, `Merge pull request #${pr.number}`);
-  r.refs.set(`refs/heads/${pr.base_ref ?? pr.base?.ref}`, c.sha);
-  pr.merged = true; pr.merged_at = new Date().toISOString(); pr.state = 'closed'; pr.merge_sha = c.sha; pr.merge_commit_sha = c.sha;
+  const mergeSha = commitTree(r, mergedEntries.map((e: any) => ({ mode: e.mode ?? '100644', name: e.name, sha: e.sha })), parents, `Merge pull request #${pr.number}`);
+  r.refs.set(`refs/heads/${pr.base_ref ?? pr.base?.ref}`, mergeSha);
+  pr.merged = true; pr.merged_at = new Date().toISOString(); pr.state = 'closed'; pr.merge_sha = mergeSha; pr.merge_commit_sha = mergeSha;
 }
 
 export function createApp(): Server {
@@ -161,10 +166,15 @@ export function createApp(): Server {
       const chunks: Buffer[] = [];
       for await (const c of req) chunks.push(c as Buffer);
       const raw = Buffer.concat(chunks).toString('utf8');
-      let parsed: any;
-      try { parsed = JSON.parse(raw); } catch { sendJson(res, 400, { message: 'invalid json' }); return; }
+      let parsed: unknown;
+      try { parsed = JSON.parse(raw); } catch { sendJson(res, 400, { message: 'Problems parsing JSON' }); return; }
+      const parsedItems = Array.isArray(parsed) ? parsed : [parsed];
+      if (parsedItems.some(item => typeof item !== 'object' || item === null || Array.isArray(item))) {
+        sendJson(res, 400, { message: 'Problems parsing JSON' });
+        return;
+      }
       const hasAuthGql = typeof req.headers['authorization'] === 'string' && req.headers['authorization'] !== '';
-      const docs: any[] = Array.isArray(parsed) ? parsed : [parsed];
+      const docs: any[] = parsedItems as any[];
       if (!hasAuthGql) { sendJson(res, 401, { message: 'Requires authentication' }); return; }
       const gqlLogin = login ?? 'octocat';
       const repoGlobalId = (key: string) => 'R_' + key.replace(/[^A-Za-z0-9_-]/g, '_');
@@ -173,11 +183,11 @@ export function createApp(): Server {
       const execOne = (doc: any): any => {
         const opName: string = String(doc.operationName ?? '');
         const vars: any = doc.variables ?? {};
-        const q: string = String(doc.query ?? '');
+        const queryText: string = String(doc.query ?? '');
         // detect operation name from query text if absent
         let name = opName;
         if (!name) {
-          const m2 = /(?:query|mutation)\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(q);
+          const m2 = /(?:query|mutation)\s+([A-Za-z_][A-Za-z0-9_]*)/.exec(queryText);
           name = m2 ? m2[1] : '';
         }
         const failField = (msg: string) => ({ errors: [{ message: msg }] });
@@ -227,24 +237,25 @@ export function createApp(): Server {
         if (name === 'IssueCreate') {
           const key = String(vars.input?.repositoryId ?? '');
           // repositoryId is our global id; find repo by scanning
-          let found: any = null; let fkey = '';
-          for (const [k, r2] of repos) { if (repoGlobalId(k) === key) { found = r2; fkey = k; break; } }
+          let found: any = null; let repositoryKey = '';
+          for (const [k, r2] of repos) { if (repoGlobalId(k) === key) { found = r2; repositoryKey = k; break; } }
           if (!found) return failField('Could not resolve to a node');
           found.issueSeq += 1;
           const n = found.issueSeq;
           found.issues.push({ number: n, title: String(vars.input?.title ?? ''), body: vars.input?.body ?? null, state: 'open', labels: [], comments: [] });
-          return { data: { createIssue: { issue: { number: n, id: issueGid(fkey, n) } } } };
+          return { data: { createIssue: { issue: { number: n, id: issueGid(repositoryKey, n) } } } };
         }
         if (name === 'IssueClose') {
-          let found: any = null; let fkey = '';
-          for (const [k, r2] of repos) { if (issueGid(k, 0).split('_')[1] === String(vars.input?.issueId ?? '').split('_')[1]) { }
+          let found: any = null; let repositoryKey = ''; let issue: any = null;
+          outer1: for (const [k, r2] of repos) {
+            issue = r2.issues.find((item: any) => issueGid(k, item.number) === String(vars.input?.issueId ?? ''));
+            if (issue) {
+              found = r2; repositoryKey = k; break outer1;
+            }
           }
-          // simpler: scan all issues for gid match
-          outer1: for (const [k, r2] of repos) { for (const i3 of r2.issues) { if (issueGid(k, i3.number) === String(vars.input?.issueId ?? '')) { found = r2; fkey = k; break outer1; } } }
           if (!found) return failField('Could not resolve to a node');
-          const i3 = found.issues.find((x: any) => issueGid(fkey, x.number) === String(vars.input?.issueId ?? ''));
-          if (i3) i3.state = 'closed';
-          return { data: { closeIssue: { issue: i3 ? { number: i3.number, id: issueGid(fkey, i3.number), state: 'CLOSED' } : null } } };
+          issue.state = 'closed';
+          return { data: { closeIssue: { issue: { number: issue.number, id: issueGid(repositoryKey, issue.number), state: 'CLOSED' } } } };
         }
         if (name === 'PullRequests') {
           const r2 = rep(String(vars.owner ?? ''), String(vars.name ?? ''));
@@ -268,8 +279,8 @@ export function createApp(): Server {
           return { data: { repository: { pullRequest: { id: prGid(`${vars.owner}/${vars.name}`, p3.number), number: p3.number } } } };
         }
         if (name === 'PullRequestCreate') {
-          let found: any = null; let fkey = '';
-          for (const [k, r2] of repos) { if (repoGlobalId(k) === String(vars.input?.repositoryId ?? '')) { found = r2; fkey = k; break; } }
+          let found: any = null; let repositoryKey = '';
+          for (const [k, r2] of repos) { if (repoGlobalId(k) === String(vars.input?.repositoryId ?? '')) { found = r2; repositoryKey = k; break; } }
           if (!found) return failField('Could not resolve to a node');
           found.pullSeq += 1;
           const n = found.pullSeq;
@@ -280,14 +291,14 @@ export function createApp(): Server {
           const files: string[] = [];
           try { files.push(...diffFiles(found, headSha, baseSha)); } catch {}
           found.pulls.push({ number: n, title: String(vars.input?.title ?? ''), body: vars.input?.body ?? null, state: 'open', head: { ref: headRef, sha: headSha }, base: { ref: baseRef, sha: baseSha }, head_ref: headRef, base_ref: baseRef, head_sha: headSha, base_sha: baseSha, merged: false, merged_at: null, merge_commit_sha: null, files, conflicted: false });
-          return { data: { createPullRequest: { pullRequest: { number: n, id: prGid(fkey, n), state: 'OPEN', headRefName: headRef, baseRefName: baseRef } } } };
+          return { data: { createPullRequest: { pullRequest: { number: n, id: prGid(repositoryKey, n), state: 'OPEN', headRefName: headRef, baseRefName: baseRef } } } };
         }
         if (name === 'MergePullRequest') {
-          let found: any = null; let fkey = ''; let p3: any = null;
-          for (const [k, r2] of repos) { const c = r2.pulls.find((x: any) => prGid(k, x.number) === String(vars.input?.pullRequestId ?? '')); if (c) { found = r2; fkey = k; p3 = c; break; } }
+          let found: any = null; let repositoryKey = ''; let p3: any = null;
+          for (const [k, r2] of repos) { const c = r2.pulls.find((x: any) => prGid(k, x.number) === String(vars.input?.pullRequestId ?? '')); if (c) { found = r2; repositoryKey = k; p3 = c; break; } }
           if (!found || !p3) return failField('Could not resolve to a node');
           doMerge(found, p3);
-          return { data: { mergePullRequest: { pullRequest: { number: p3.number, merged: p3.merged, state: p3.merged ? 'MERGED' : 'OPEN' } } } };
+          return { data: { mergePullRequest: { pullRequest: { id: prGid(repositoryKey, p3.number), number: p3.number, merged: p3.merged, state: p3.merged ? 'MERGED' : 'OPEN' } } } };
         }
         if (name === 'NodeRepository') {
           for (const [k, r2] of repos) { if (repoGlobalId(k) === String(vars.id ?? '')) { const [o3, n3] = k.split('/'); return { data: { node: { id: repoGlobalId(k), name: r2.name, nameWithOwner: `${o3}/${r2.name}` } } }; } }
@@ -435,8 +446,8 @@ export function createApp(): Server {
     if (method === 'GET' && path === '/api/v3/meta') { sendJson(res, 200, { installed_version: '1.0.0' }); return; }
     if (method === 'GET' && path === '/api/v3/user') { sendJson(res, 200, { login, id: 1, type: 'User' }); return; }
     if (method === 'GET' && path === '/api/v3/user/repos') {
-      const per = Math.min(30, Math.max(1, Number(q.get('per_page') ?? 30)));
-      const page = Math.max(1, Number(q.get('page') ?? 1));
+      const per = Math.min(30, Math.max(1, parseIntInput(q.get('per_page'), 30) ?? 30));
+      const page = Math.max(1, parseIntInput(q.get('page'), 1) ?? 1);
       const all = userRepos(login).map(r => repoJson(r));
       const slice = all.slice((page - 1) * per, page * per);
       const headers: Record<string, string> = {};
@@ -520,7 +531,7 @@ export function createApp(): Server {
       const out: Json[] = [];
       let sha = r.refs.get(`refs/heads/${ref}`) ?? r.refs.get(ref) ?? ref;
       while (sha && getObj(sha)) {
-        out.push(commitJson(r, sha));
+        out.push(commitJson(sha));
         const c = getObj(sha) as CommitObj;
         sha = c.parents[0] ?? '';
         if (out.length >= 30) break;
@@ -531,7 +542,7 @@ export function createApp(): Server {
     const cM = /^\/commits\/([0-9a-f]{40})$/.exec(rest);
     if (method === 'GET' && cM) {
       if (!getObj(cM[1])) { sendJson(res, 404, { message: 'Not Found' }); return; }
-      sendJson(res, 200, commitJson(r, cM[1]));
+      sendJson(res, 200, commitJson(cM[1]));
       return;
     }
 
